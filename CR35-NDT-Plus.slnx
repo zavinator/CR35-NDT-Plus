@@ -2,5 +2,5 @@
   <Configurations>
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="CR35-NDT-Plus.vcxproj" />
+  <Project Path="CR35-NDT-Plus.vcxproj" Id="a2edde6e-ed07-4c6e-89e5-de0e074857ed" />
 </Solution>

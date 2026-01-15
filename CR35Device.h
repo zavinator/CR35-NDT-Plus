@@ -4,8 +4,8 @@
 #include <qlist.h>
 #include <qtimer.h>
 #include <qdatetime.h>
-#include <qimage.h>
 
+#include "CR35Utils.h"
 #include "Logger.h"
 
 #include <cstdint>
@@ -51,6 +51,18 @@ public:
 	uint32_t getState() const { return m_state; }
 
     /**
+     * @brief Check if the device is currently connected.
+     * @return true if connected, false otherwise.
+	 */
+	bool isConnected() const { return m_socket.state() == QTcpSocket::ConnectedState; }
+
+    /**
+     * @brief Get the list of available acquisition modes.
+     * @return List of mode names as QStringList.
+	 */
+	const QStringList& getModeList() const { return m_modeList; }
+
+    /**
      * @brief Initiate TCP connection to the device.
      *
      * This starts connection establishment to the provided IPv4/IPv6
@@ -68,7 +80,8 @@ signals:
 	void error(const QString& errorString); ///< Emitted when a socket or protocol error occurs.
 	void started(); ///< Emitted when acquisition has started.
 	void stopped(); ///< Emitted when acquisition has stopped.
-	void imageDataReceived(const QImage& image); ///< Emitted when a complete image has been received.
+	void imageDataReceived(uint16_t *data, int width, int height); ///< Emitted when a complete image has been received.
+	void newDataReceived(); ///< Emitted when new data packets have been received.
 
 public slots:
 
@@ -102,17 +115,7 @@ private slots:
 	void sendImageDataRequest(); ///< Send a request for image data from the device.
 
 private:
-    /**
-     * @brief Packet data type identifiers used by the protocol.
-     */
-    enum Type : uint16_t {
-		TYPE_UNKNOWN    = 0x0000,
-        TYPE_U32        = 0x0002,
-        TYPE_STRING     = 0x0007,
-        TYPE_U16        = 0x000B,
-        TYPE_BLOB       = 0x0008
-    };
-
+   
 	/**
 	 * @brief Tokens that must be translated into session IDs before use.
 	 *
@@ -138,27 +141,6 @@ private:
 	};
 
     /**
-     * @brief Data markers used in incoming data streams.
-	 */
-    enum DataMarker : uint16_t {
-        DATA_MARKER_IMAGE_END = 0xFFFBu, ///< End of image: Marks end of image data block
-        DATA_MARKER_CONFIG = 0xFFFCu, ///< Config: Next word is size of JSON, then JSON data
-		DATA_MARKER_NOP = 0xFFFDu, ///< No-op: Padding word, ignore
-        DATA_MARKER_LINE_START = 0xFFFEu, ///< Start of line: Next word is left x padding
-		DATA_MARKER_LINE_END = 0xFFFFu  ///< End of line: Next word is right x padding
-    };
-
-    /**
-     * @brief Packet kinds used when building outgoing packets.
-     */
-    enum Packet : uint16_t {
-		PACKET_UNKNOWN    = 0x0000u,
-        PACKET_READ_TOKEN = 0x0003u,
-		PACKET_READ_DATA  = 0x0010u,
-        PACKET_COMMAND    = 0x0011u,
-    };
-
-    /**
      * @brief Representation of a pending command or read request.
      *
      * `packet` selects whether the item is a read (PACKET_READ_DATA) or
@@ -168,7 +150,7 @@ private:
     struct Command {
         QByteArray name;
         Packet packet = PACKET_UNKNOWN;
-        Type type = TYPE_UNKNOWN;
+        DataType type = TYPE_UNKNOWN;
         QVariant value;
 
         /**
@@ -184,21 +166,8 @@ private:
 
         Command() { }
 		Command(const QByteArray& n, Packet p = PACKET_READ_DATA) : name(n), packet(p) { }
-        Command(const QByteArray& n, Type t, const QVariant& v) : name(n), packet(PACKET_COMMAND), type(t), value(v) { }
+        Command(const QByteArray& n, DataType t, const QVariant& v) : name(n), packet(PACKET_COMMAND), type(t), value(v) { }
     };
-
-	// 14 bytes header
-    #pragma pack(push, 1)
-    struct ServerHeader {
-        uint8_t flags;       ///< 0x01 = More fragments follow, 0x00 = Last fragment or End
-        uint8_t packetType;  ///< 0x11 = Data payload, 0x00 = Footer/Control packet
-        uint16_t block;      ///< Sequence counter, starts at 0 (Big Endian)
-        uint32_t token;      ///< Session ID / Stream identifier (Big Endian)
-        uint32_t size;       ///< Total bytes remaining to be read including this block (Big Endian)
-        uint16_t mode;       ///< 0x0008 = Fragmented Stream, 0x0007 = Single Packet (Big Endian)
-    };
-    #pragma pack(pop)
-    static constexpr int HEADER_SIZE = sizeof(ServerHeader);
 
 	/**
 	 * @brief Parse a server header from raw bytes.
@@ -267,16 +236,11 @@ private:
 	int parseJsonConfig(const QByteArray& jsonData) const;
 
 	void processImageData(); ///< Process assembled image data packet when complete.
-	
-
-
-    static constexpr int IMAGE_DATA_REQUEST_INTERVAL_MS = 300; ///< Interval between image data requests.
-	static constexpr int TIMEOUT_MS = 2000; ///< Command response timeout in milliseconds.
-	static constexpr int COMMAND_QUEUE_INTERVAL_MS = 10; ///< Interval between sending queued commands.
 
 	QTcpSocket m_socket; ///< Internal TCP socket for device communication.
 	QByteArray m_buffer; ///< Buffer for incoming data assembly.
 	QByteArray m_imageData; ///< Buffer for assembling image data packets.
+	QStringList m_modeList; ///< List of available acquisition modes.
 
 	QByteArray m_clientId; ///< Random client identifier.
 	QHash<QString, int> m_tokens; ///< Map of token names to numeric session IDs.

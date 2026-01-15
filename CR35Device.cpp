@@ -1,6 +1,5 @@
 #include "CR35Device.h"
 
-#include <qendian.h>
 #include <qrandom.h>
 #include <qeventloop.h>
 #include <qjsondocument.h>
@@ -10,23 +9,12 @@
 #include <limits>
 #include <vector>
 
-static inline void appendBE16(QByteArray& out, quint16 v)
-{
-    const quint16 be = qToBigEndian<quint16>(v);
-    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
-}
-
-static inline void appendBE32(QByteArray& out, quint32 v)
-{
-    const quint32 be = qToBigEndian<quint32>(v);
-    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
-}
-
 
 CR35Device::CR35Device(Logger &logger, QObject* parent) : QObject(parent), 
     m_logger(logger)
 {
 	connect(&m_socket, &QTcpSocket::connected, this, &CR35Device::init);
+	connect(&m_socket, &QTcpSocket::connected, this, &CR35Device::connected);
 	connect(&m_socket, &QTcpSocket::disconnected, this, &CR35Device::disconnected);
 	connect(&m_socket, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError socketError) {
 		emit error(m_socket.errorString());
@@ -129,23 +117,29 @@ void CR35Device::readData()
         
         if (header.token == getTokenId("ModeList"))
         {
-            const QStringList modes = parseModeList(payload);
-			m_logger.message("Received ModeList with " + QString::number(modes.size()) + " modes");
-            m_logger.message("ModeList modes: " + modes.join(", "));
+            m_modeList = parseModeList(payload);
+			m_logger.message("Received ModeList with " + QString::number(m_modeList.size()) + " modes");
+            m_logger.message("ModeList modes: " + m_modeList.join(", "));
         }
         else if (header.token == getTokenId("ImageData"))
         {
 			m_logger.message("Received ImageData of size: " + QString::number(payload.size()));
 			m_imageData.append(payload);
+			if (payload.size() > 32) // only for large packets
+			    emit newDataReceived();
 
-            if (m_state == STATE_WAITING && m_wasScanning && payload.size() == 4) // seems the last packet has size 4
-            {
-                processImageData();
-                m_wasScanning = false;
-                m_imageData.clear();
-            }
+			if (m_state == STATE_WAITING && m_wasScanning && m_imageData.size() >= sizeof(uint16_t))
+			{
+				const uint16_t lastWord = qFromLittleEndian<uint16_t>(m_imageData.constData() + m_imageData.size() - sizeof(uint16_t));
+				if (lastWord == DATA_MARKER_IMAGE_END)
+				{
+					processImageData();
+					m_wasScanning = false;
+					m_imageData.clear();
+				}
+			}
 			
-            if (m_started) m_dataTimer.start(); // enqueue next packet
+			if (m_started) m_dataTimer.start(); // enqueue next packet
 		}
         else if (header.token == getTokenId("SystemState"))
         {
@@ -193,7 +187,7 @@ void CR35Device::readData()
     m_buffer.clear();
 }
 
-CR35Device::ServerHeader CR35Device::parseHeader(const QByteArray& data)
+ServerHeader CR35Device::parseHeader(const QByteArray& data)
 {
     // Parses the server-side RX packet header.
     // Structure (big-endian): [Cmd:2] [Flags:2] [Token:4] [Len:4] [Type:2]
@@ -599,19 +593,19 @@ void CR35Device::processImageData()
 
     m_logger.message("Processing received image data of size: " + QString::number(m_imageData.size()));
 
+#ifdef _DEBUG
+    QFile debugFile("CR35_Image.bin");
+    if (debugFile.open(QIODevice::WriteOnly))
+    {
+        debugFile.write(m_imageData);
+        debugFile.close();
+	}
+#endif
+
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(m_imageData.constData());
     const uint8_t* end = ptr + m_imageData.size();
-	constexpr size_t UINT16_SIZE = sizeof(uint16_t);
 
-	///< Scanner scanline data line.
-    struct ScanLine {
-		uint16_t leftPadding = 0; ///< Number of pixels to skip on the left
-		const uint16_t* pixelDataPtr = nullptr; ///< Pointer to pixel data array
-		uint16_t pixelDataCount = 0; ///< Number of pixels in pixel data array
-		uint16_t rightPadding = 0; ///< Number of pixels to skip on the right
-    };    
-	std::vector<ScanLine> image;
-	ScanLine currentLine;
+	LineAssembler assembler;
 	bool parsingPixels = false;
 	int pixLine = 0; // maximum width of image
 
@@ -625,29 +619,34 @@ void CR35Device::processImageData()
         {
             switch (word) 
             {
-                case DATA_MARKER_LINE_START: 
+                case DATA_MARKER_START: 
                 {
                     if (ptr + UINT16_SIZE > end) break;
+				    // New line begins. Flush any previously open line now.
+				    assembler.flushLine();
+				    parsingPixels = false;
 
-                    currentLine = {};
-                    currentLine.leftPadding = qFromLittleEndian<uint16_t>(ptr);
-                    ptr += UINT16_SIZE; 
-
-					parsingPixels = true;
+				    assembler.currentLine = {};
+				    assembler.currentSeg = {};
+				    assembler.inLine = true;
+				    assembler.x = qFromLittleEndian<uint16_t>(ptr);
+				    ptr += UINT16_SIZE;
+				    parsingPixels = true;
                     break;
                 }
 
-                case DATA_MARKER_LINE_END:
+                case DATA_MARKER_GAP:
                 {
                     if (ptr + UINT16_SIZE > end) break;
+				    const uint16_t gap = qFromLittleEndian<uint16_t>(ptr);
+				    ptr += UINT16_SIZE;
 
-					currentLine.rightPadding = qFromLittleEndian<uint16_t>(ptr);
-                    ptr += UINT16_SIZE; 
-                    
-                    if (currentLine.pixelDataCount > 0)
-                    {
-                        image.push_back(currentLine);
-                    }
+				    if (assembler.inLine)
+				    {
+					    assembler.flushSegment();
+						assembler.x = static_cast<uint16_t>(assembler.x + gap);
+					    parsingPixels = true;
+				    }
                     break;
                 }
 
@@ -672,7 +671,10 @@ void CR35Device::processImageData()
                 }
 
                 case DATA_MARKER_NOP:
+                    break;
                 case DATA_MARKER_IMAGE_END:
+					assembler.flushLine();
+					parsingPixels = false;
                     break;
 
                 default:
@@ -683,11 +685,22 @@ void CR35Device::processImageData()
         // Process Pixel Data
         else if (parsingPixels) 
         {
-			if (!currentLine.pixelDataPtr)
-                currentLine.pixelDataPtr = reinterpret_cast<const uint16_t*>(ptr - UINT16_SIZE);
-			currentLine.pixelDataCount++;
+			if (!assembler.inLine)
+				continue;
+
+			if (!assembler.currentSeg.pixelDataPtr)
+			{
+				assembler.currentSeg.xStart = assembler.x;
+				assembler.currentSeg.pixelDataPtr = reinterpret_cast<const uint16_t*>(ptr - UINT16_SIZE);
+			}
+			assembler.currentSeg.pixelCount++;
+			assembler.x++;
         }
     }
+
+	// If stream ended without explicit IMAGE_END, still flush whatever we parsed.
+	assembler.flushLine();
+	std::vector<ScanLine>& image = assembler.image;
 
 	m_logger.message("Total lines received in image: " + QString::number(image.size()));
 
@@ -700,15 +713,13 @@ void CR35Device::processImageData()
     // Calculate bounding box (crop empty space)
     for (const auto& line : image)
     {
-        if (line.pixelDataCount > 0)
-        {
-            if (line.leftPadding < minLeft)
-                minLeft = line.leftPadding;
-
-            const int right = line.leftPadding + line.pixelDataCount;
-            if (right > maxRight)
-                maxRight = right;
-        }
+		for (const auto& seg : line.segments)
+		{
+			if (seg.pixelCount <= 0)
+				continue;
+			minLeft = std::min(minLeft, seg.xStart);
+			maxRight = std::max(maxRight, seg.xStart + seg.pixelCount);
+		}
     }
 
     if (maxRight == 0) // No pixels found
@@ -717,28 +728,44 @@ void CR35Device::processImageData()
     const int width = maxRight - minLeft;
     const int height = static_cast<int>(image.size());
 
-    // Use QImage to assemble the lines
-    QImage img(width, height, QImage::Format_Grayscale16);
-    img.fill(Qt::white);
+	uint16_t* img = new uint16_t[width * height];
+	memset(img, 0xFFFF, width * height * sizeof(uint16_t)); // initialize to white
 
     for (int y = 0; y < height; ++y)
     {
         const auto& line = image[y];
-        
-        if (line.pixelDataPtr && line.pixelDataCount > 0)
-        {
-            uint16_t* dst = reinterpret_cast<uint16_t*>(img.scanLine(y));
-            
-            // Apply left padding relative to minLeft (crop)
-            const int offset = line.leftPadding - minLeft;
-            if (offset >= 0 && offset + line.pixelDataCount <= width)
-            {
-               memcpy(dst + offset, line.pixelDataPtr, line.pixelDataCount * sizeof(uint16_t));
-            }
-        }
+        uint16_t* dst = img + (y * width);
+
+		if (pixLine > 0)
+		{
+			if (line.endX != pixLine)
+			{
+				m_logger.warning("Scanline width mismatch: line=" + QString::number(y) +
+					" endX=" + QString::number(line.endX) +
+					" pixLine=" + QString::number(pixLine) +
+					" segments=" + QString::number(static_cast<int>(line.segments.size())));
+				#ifdef _DEBUG
+				assert(line.endX == pixLine);
+				#endif
+			}
+		}
+
+		for (const auto& seg : line.segments)
+		{
+			if (!seg.pixelDataPtr || seg.pixelCount <= 0)
+				continue;
+
+			const int offset = seg.xStart - minLeft;
+			if (offset < 0)
+				continue;
+
+			const int copyCount = std::min(seg.pixelCount, width - offset);
+			if (copyCount > 0)
+				memcpy(dst + offset, seg.pixelDataPtr, copyCount * sizeof(uint16_t));
+		}
     }
 
-    emit imageDataReceived(img);
+    emit imageDataReceived(img, width, height);
 }
 
 int CR35Device::parseJsonConfig(const QByteArray& jsonData) const

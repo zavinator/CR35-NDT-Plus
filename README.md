@@ -134,7 +134,7 @@ The stream contains pixel data interleaved with special **Control Markers** (val
 - **Pixels**: Standard 16-bit grayscale values.
 - **Markers**:
     -   `0xFFFE` (**Line Start**): Followed by `Left Padding` (X-offset).
-    -   `0xFFFF` (**Line End**): Followed by `Right Padding` (Unused space).
+    -   `0xFFFF` (**Gap / Skip**): Followed by a 16-bit value indicating how many pixels to skip (advance X) inside the current line.
     -   `0xFFFC` (**Config**): Followed by size `N`, then `N` bytes of **JSON** metadata (e.g., Model Name, BitsStored).
     -   `0xFFFB` (**Image End**): Marks the end of the frame.
     -   `0xFFFD` (**NOP**): Padding/Keep-alive (?)

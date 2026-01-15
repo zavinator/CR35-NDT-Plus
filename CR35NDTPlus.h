@@ -13,7 +13,7 @@ public:
 
 private slots:
 
-    void saveImage(const QImage&);
+    void saveImage(const uint16_t* data, int width, int height);
 
 private:
     Ui::CR35NDTPlusClass ui;
